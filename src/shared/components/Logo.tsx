@@ -1,7 +1,7 @@
 import type { FC } from 'react';
 
 interface LogoProps {
-  size?: 'sm' | 'md' | 'lg';
+  size?: 'sm' | 'md' | 'lg' | 'xl';
   showText?: boolean;
   variant?: 'light' | 'dark';
 }
@@ -10,18 +10,22 @@ const sizeMap = {
   sm: { height: 32 },
   md: { height: 40 },
   lg: { height: 56 },
+  xl: { height: 80 },
 } as const;
 
 /**
  * Yojo Solutions branded logo using transparent PNG.
- * Works on both light and dark backgrounds.
- * - variant="light": applies brightness filter for better visibility on dark bg
  * - variant="dark" (default): standard rendering for light backgrounds
+ * - variant="light": adds glow/drop-shadow for visibility on dark backgrounds
  */
 export const Logo: FC<LogoProps> = ({ size = 'md', showText = true, variant = 'dark' }) => {
   const { height } = sizeMap[size];
   const base = import.meta.env.BASE_URL || '/';
-  const filterStyle = variant === 'light' ? { filter: 'brightness(1.3) contrast(1.1)' } : {};
+
+  // On dark backgrounds, use drop-shadow to make the logo pop without washing it out
+  const darkBgStyle = variant === 'light'
+    ? { filter: 'drop-shadow(0 0 12px rgba(255,255,255,0.25)) drop-shadow(0 0 4px rgba(255,255,255,0.15))' }
+    : {};
 
   if (!showText) {
     return (
@@ -29,7 +33,7 @@ export const Logo: FC<LogoProps> = ({ size = 'md', showText = true, variant = 'd
         <img
           src={`${base}yojo-logo.png`}
           alt="Yojo Solutions"
-          style={{ height: height * 1.15, objectFit: 'contain', objectPosition: 'left center', ...filterStyle }}
+          style={{ height: height * 1.15, objectFit: 'contain', objectPosition: 'left center', ...darkBgStyle }}
         />
       </div>
     );
@@ -39,7 +43,7 @@ export const Logo: FC<LogoProps> = ({ size = 'md', showText = true, variant = 'd
     <img
       src={`${base}yojo-logo.png`}
       alt="Yojo Solutions — Job Hunter Platform"
-      style={{ height, ...filterStyle }}
+      style={{ height, ...darkBgStyle }}
       className="object-contain flex-shrink-0"
     />
   );

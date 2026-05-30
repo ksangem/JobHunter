@@ -46,7 +46,7 @@ export default function LoginPage() {
           <div className="absolute bottom-20 right-20 w-96 h-96 rounded-full bg-accent-500/20 blur-3xl" />
         </div>
         <div className="relative z-10 flex flex-col justify-center px-16 text-white">
-          <Logo size="lg" showText variant="light" />
+          <Logo size="xl" showText variant="light" />
           <p className="mt-6 text-xl text-primary-200 leading-relaxed max-w-md">
             AI-Powered Recruitment & Talent Acquisition Platform
           </p>

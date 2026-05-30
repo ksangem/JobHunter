@@ -69,7 +69,7 @@ export default function RegisterPage() {
             <Logo size="md" showText />
           </div>
           <h1 className="text-2xl font-bold text-center text-surface-900 mb-2">Create your account</h1>
-          <p className="text-center text-surface-500 mb-10">Choose how you'd like to use Job Hunter</p>
+          <p className="text-center text-surface-500 mb-10">Choose how you'd like to use our platform</p>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <button

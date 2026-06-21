@@ -1,0 +1,22 @@
+{
+  "cli": { "version": ">= 12.0.0", "appVersionSource": "remote" },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "staging": {
+      "distribution": "internal",
+      "ios": { "simulator": false },
+      "env": { "APP_ENV": "staging" }
+    },
+    "production": {
+      "ios": { "enterpriseProvisioning": "universal" },
+      "env": { "APP_ENV": "production" },
+      "autoIncrement": true
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

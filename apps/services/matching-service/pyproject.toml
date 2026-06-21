@@ -1,0 +1,17 @@
+[project]
+name = "matching-service"
+version = "2.0.0"
+description = "JobHunter matching-service — semantic candidate<->JD matching & ranking (FR-R-030..039)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.36",
+    "asyncpg>=0.30.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+]
+
+[tool.uvicorn]
+host = "0.0.0.0"
+port = 3004

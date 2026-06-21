@@ -1,0 +1,41 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build outputs
+dist/
+web-build/
+.expo/
+.turbo/
+*.tsbuildinfo
+
+# native
+ios/
+android/
+*.keystore
+!debug.keystore
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# testing
+coverage/
+.detox/
+
+# misc
+.DS_Store
+*.pem
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# local tooling
+.claude/settings.local.json

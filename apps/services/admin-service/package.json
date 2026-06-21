@@ -1,0 +1,32 @@
+{
+  "name": "@jobhunter/admin-service",
+  "version": "2.0.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "nest build",
+    "start": "node dist/main",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo ok"
+  },
+  "dependencies": {
+    "@jobhunter/config": "workspace:*",
+    "@jobhunter/database": "workspace:*",
+    "@jobhunter/kafka": "workspace:*",
+    "@jobhunter/logger": "workspace:*",
+    "@jobhunter/redis": "workspace:*",
+    "@jobhunter/types": "workspace:*",
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/config": "^3.2.0",
+    "@nestjs/core": "^11.0.0",
+    "@nestjs/platform-express": "^11.0.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

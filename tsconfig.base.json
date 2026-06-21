@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": false,
+    "paths": {
+      "@jobhunter/types": ["./packages/types/src"],
+      "@jobhunter/types/*": ["./packages/types/src/*"],
+      "@jobhunter/config": ["./packages/config/src"],
+      "@jobhunter/logger": ["./packages/logger/src"],
+      "@jobhunter/kafka": ["./packages/kafka/src"],
+      "@jobhunter/redis": ["./packages/redis/src"]
+    }
+  },
+  "exclude": ["node_modules", "dist", ".expo", "web-build"]
+}

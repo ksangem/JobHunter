@@ -1,0 +1,806 @@
+// ============================================================================
+// JobHunter — Canonical Prisma schema (Tech Specs §3).
+//
+// This is the single source of truth for the relational data model. Enums here
+// MIRROR @jobhunter/types/src/enums.ts exactly (keep both in sync).
+//
+// Key BRD invariants encoded below:
+//   - Candidate is a GLOBAL pool: NO org_id (G-025). Cross-org reads are
+//     field-masked + audited (see rls.sql) instead of RLS-isolated.
+//   - All org-scoped tables carry org_id and are protected by Postgres RLS
+//     (see prisma/rls.sql) — RLS is the LAST line of defence behind the
+//     tenant-context middleware (see src/index.ts withTenant()).
+//   - Application is deduped per (candidate_id, jd_id) — Critical Rule §6.
+//   - AuditLog / AiAuditLog / ShortlistAction are append-only (immutable):
+//     UPDATE/DELETE blocked by Postgres rules in rls.sql.
+//   - JobDescription.expected_close_date is MANDATORY (FR-R-013).
+//   - Session implements refresh-token rotation + reuse detection (G-018).
+// ============================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+// ----------------------------------------------------------------------------
+// Enums (mirror @jobhunter/types)
+// ----------------------------------------------------------------------------
+
+enum Role {
+  CANDIDATE
+  RECRUITER
+  HIRING_MANAGER
+  ORG_ADMIN
+  VIEWER
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+enum CandidateStage {
+  REGISTERED
+  EMAIL_VERIFIED
+  CV_PARSING
+  PROFILE_READY
+  DISCOVERABLE
+}
+
+enum OrgStatus {
+  REGISTERED
+  DPA_PENDING
+  DPA_SIGNED
+  PROVISIONED
+  ACTIVE
+  SUSPENDED
+}
+
+enum JdStatus {
+  DRAFT
+  REVIEW
+  APPROVED
+  ACTIVE
+  ARCHIVED
+}
+
+enum ApplicationStage {
+  SOURCED
+  SUBMITTED
+  VIEWED
+  SHORTLISTED
+  SCREENING
+  INTERVIEW
+  FEEDBACK
+  OFFER
+  HIRED
+  REJECTED
+  WITHDRAWN
+  NO_SHOW
+}
+
+enum CvStatus {
+  ACTIVE
+  INACTIVE
+  PARSING
+  FAILED
+}
+
+enum RebuildSource {
+  ORIGINAL
+  AI
+}
+
+enum ConsentType {
+  VOICE_AI
+  RECORDING
+  TOS
+  MARKETING
+}
+
+enum ConsentStatus {
+  GRANTED
+  DENIED
+  REVOKED
+  PENDING
+}
+
+enum CampaignStatus {
+  DRAFT
+  LAUNCHED
+  PAUSED
+  COMPLETED
+}
+
+enum CallStatus {
+  PENDING
+  SKIPPED
+  INITIATED
+  ANSWERED
+  SCREENING
+  COMPLETED
+  FAILED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  CONFIRMED
+  RESCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum InterviewType {
+  PHONE_SCREEN
+  TECHNICAL
+  SYSTEM_DESIGN
+  HR
+  MANAGERIAL
+  FINAL
+}
+
+enum OfferStatus {
+  DRAFT
+  APPROVED
+  SENT
+  ACCEPTED
+  DECLINED
+  REVOKED
+}
+
+enum WorkMode {
+  ONSITE
+  HYBRID
+  REMOTE
+}
+
+enum NotificationType {
+  APPLICATION_UPDATE
+  INTERVIEW
+  MATCH
+  MESSAGE
+  SYSTEM
+  CONSENT
+}
+
+enum AiFunction {
+  RESUME_PARSING
+  ATS_SCORING
+  RESUME_REDESIGN
+  JD_PARSING
+  PRIORITY_MATRIX
+  CANDIDATE_MATCHING
+  CANDIDATE_RANKING
+  VOICE_SCREENING
+  DYNAMIC_QUESTIONING
+  SIMILARITY
+}
+
+// ----------------------------------------------------------------------------
+// Tenancy & identity
+// ----------------------------------------------------------------------------
+
+model Organisation {
+  id           String    @id @default(uuid()) @db.Uuid
+  name         String
+  status       OrgStatus @default(REGISTERED)
+  tier         String    @default("STARTER") // STARTER | GROWTH | ENTERPRISE
+  seatsTotal   Int       @default(5) @map("seats_total")
+  seatsFilled  Int       @default(0) @map("seats_filled")
+  dpaSignedAt  DateTime? @map("dpa_signed_at")
+  region       String    @default("ap-south-1")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  users           User[]
+  jobDescriptions JobDescription[]
+  voiceCampaigns  VoiceCampaign[]
+  emailCampaigns  EmailCampaign[]
+  blacklist       BlacklistEntry[]
+  screeningQs     ScreeningQuestion[]
+
+  @@index([status])
+  @@map("organisations")
+}
+
+model User {
+  id          String     @id @default(uuid()) @db.Uuid
+  email       String     @unique
+  passwordHash String?   @map("password_hash") // null for pure-OAuth accounts
+  fullName    String     @map("full_name")
+  role        Role       @default(CANDIDATE)
+  status      UserStatus @default(PENDING)
+  orgId       String?    @map("org_id") @db.Uuid // null for CANDIDATE (global)
+  mfaEnabled  Boolean    @default(false) @map("mfa_enabled")
+  avatarUrl   String?    @map("avatar_url")
+  googleId    String?    @unique @map("google_id")
+  lastLoginAt DateTime?  @map("last_login_at")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  org        Organisation? @relation(fields: [orgId], references: [id])
+  sessions   Session[]
+  mfaSecret  MfaSecret?
+  candidate  Candidate?
+  notifications Notification[]
+  deviceTokens DeviceToken[]
+
+  @@index([orgId])
+  @@index([status])
+  @@index([role])
+  @@map("users")
+}
+
+// Refresh-token rotation + reuse detection (G-018). Each refresh issues a new
+// row and revokes its parent; presenting an already-rotated token (reused) =>
+// revoke the entire family (detected via rotatedFromId chain + revokedAt).
+model Session {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  // SHA-256 of the refresh token (never store the raw token).
+  refreshTokenHash String @unique @map("refresh_token_hash")
+  jti           String    @unique // matches access-token jti for denylist correlation
+  familyId      String    @map("family_id") @db.Uuid // shared across a rotation chain
+  rotatedFromId String?   @map("rotated_from_id") @db.Uuid
+  userAgent     String?   @map("user_agent")
+  ip            String?
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  reuseDetected Boolean   @default(false) @map("reuse_detected")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model MfaSecret {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @unique @map("user_id") @db.Uuid
+  secret        String   // base32 TOTP secret (encrypt at rest via KMS in prod)
+  recoveryCodes String[] @map("recovery_codes") // bcrypt-hashed one-time codes
+  enabled       Boolean  @default(false)
+  verifiedAt    DateTime? @map("verified_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_secrets")
+}
+
+// ----------------------------------------------------------------------------
+// Candidate domain — GLOBAL POOL (NO org_id, G-025)
+// ----------------------------------------------------------------------------
+
+// Golden record. Intentionally has NO org_id: candidates are a global, shared
+// talent pool. Cross-org PII access is governed by field-masking-until-consent
+// + audited reads (see AuditLog) rather than RLS. See rls.sql header.
+model Candidate {
+  id              String         @id @default(uuid()) @db.Uuid
+  masterId        String         @unique @map("master_id") // CAND_XXXXXX
+  userId          String?        @unique @map("user_id") @db.Uuid // null = externally sourced
+  fullName        String         @map("full_name")
+  email           String?        // masked-until-consent for cross-org reads
+  phone           String?        // E.164, masked-until-consent
+  timezone        String?
+  headline        String?
+  location        String?
+  stage           CandidateStage @default(REGISTERED)
+  // Skills stored as JSON (Skill[] from @jobhunter/types) rather than a join
+  // table — they are AI-extracted, frequently rewritten, and queried as a blob.
+  skills          Json           @default("[]")
+  experiences     Json           @default("[]")
+  education       Json           @default("[]")
+  experienceYears Float          @default(0) @map("experience_years")
+  atsScore        Int?           @map("ats_score")
+  completeness    Int?
+  source          String         @default("PLATFORM") // PLATFORM|LINKEDIN|NAUKRI|INDEED|REFERRAL
+  enrichedAt      DateTime?      @map("enriched_at")
+  voiceEnrolled   Boolean        @default(false) @map("voice_enrolled")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  user           User?          @relation(fields: [userId], references: [id])
+  cvVersions     CvVersion[]
+  jobPreference  JobPreference?
+  applications   Application[]
+  consentLogs    ConsentLog[]
+  callLogs       CallLog[]
+  mergeLogsInto  CandidateMergeLog[] @relation("MergeTarget")
+  mergeLogsFrom  CandidateMergeLog[] @relation("MergeSource")
+
+  @@index([stage])
+  @@index([source])
+  @@index([createdAt])
+  @@map("candidates")
+}
+
+model CvVersion {
+  id            String        @id @default(uuid()) @db.Uuid
+  candidateId   String        @map("candidate_id") @db.Uuid
+  filename      String
+  status        CvStatus      @default(PARSING)
+  rebuildSource RebuildSource @default(ORIGINAL) @map("rebuild_source")
+  sourceJdId    String?       @map("source_jd_id") @db.Uuid
+  atsScore      Int?          @map("ats_score")
+  sizeBytes     Int           @default(0) @map("size_bytes")
+  storageKey    String        @map("storage_key") // S3 object key
+  parsedData    Json?         @map("parsed_data")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  // NOTE: business rule = at most ONE ACTIVE CvVersion per candidate. Prisma
+  // cannot express a partial unique index (WHERE status='ACTIVE'). This
+  // placeholder documents intent; the real constraint is added in a migration:
+  //   CREATE UNIQUE INDEX cv_one_active_per_candidate
+  //     ON cv_versions (candidate_id) WHERE status = 'ACTIVE';
+  @@unique([candidateId, status], name: "cv_active_placeholder")
+  @@index([candidateId])
+  @@index([status])
+  @@map("cv_versions")
+}
+
+model JobPreference {
+  id             String    @id @default(uuid()) @db.Uuid
+  candidateId    String    @unique @map("candidate_id") @db.Uuid
+  targetRoles    String[]  @map("target_roles")
+  targetLocations String[] @map("target_locations")
+  minSalary      Int?      @map("min_salary")
+  currency       String?
+  workMode       WorkMode?
+  noticePref     Int?      @map("notice_pref") // days
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@map("job_preferences")
+}
+
+// ----------------------------------------------------------------------------
+// JD & applications (org-scoped)
+// ----------------------------------------------------------------------------
+
+model JobDescription {
+  id                  String   @id @default(uuid()) @db.Uuid
+  orgId               String   @map("org_id") @db.Uuid
+  title               String
+  status              JdStatus @default(DRAFT)
+  location            String
+  workMode            WorkMode @default(ONSITE) @map("work_mode")
+  expMin              Int      @default(0) @map("exp_min")
+  expMax              Int?     @map("exp_max")
+  salaryMin           Int?     @map("salary_min")
+  salaryMax           Int?     @map("salary_max")
+  currency            String?
+  skills              String[]
+  description         String?
+  expectedCloseDate   DateTime @map("expected_close_date") // MANDATORY (FR-R-013)
+  // Priority matrix stored inline as JSON (PriorityMatrix from @jobhunter/types):
+  // weights for skills/experience/notice/location/salary/cert used by matching.
+  priorityMatrix      Json?    @map("priority_matrix")
+  createdBy           String   @map("created_by") @db.Uuid
+  approvedBy          String?  @map("approved_by") @db.Uuid
+  extractionConfidence Float?  @map("extraction_confidence")
+  aiExtracted         Boolean  @default(false) @map("ai_extracted")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  org          Organisation @relation(fields: [orgId], references: [id])
+  applications Application[]
+
+  @@index([orgId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([orgId, status])
+  @@map("job_descriptions")
+}
+
+model Application {
+  id            String           @id @default(uuid()) @db.Uuid
+  candidateId   String           @map("candidate_id") @db.Uuid
+  jdId          String           @map("jd_id") @db.Uuid
+  orgId         String           @map("org_id") @db.Uuid // denormalised for RLS
+  stage         ApplicationStage @default(SOURCED)
+  matchScore    Int?             @map("match_score")
+  rescored      Boolean          @default(false) // FR-R-034 "CV updated" badge
+  appliedAt     DateTime         @default(now()) @map("applied_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  candidate       Candidate         @relation(fields: [candidateId], references: [id])
+  jd              JobDescription    @relation(fields: [jdId], references: [id])
+  shortlistActions ShortlistAction[]
+  interviews      Interview[]
+  offers          Offer[]
+
+  // Dedup: one application per (candidate, JD) — Critical Rule §6.
+  @@unique([candidateId, jdId])
+  @@index([orgId])
+  @@index([candidateId])
+  @@index([jdId])
+  @@index([stage])
+  @@index([orgId, stage])
+  @@map("applications")
+}
+
+// Append-only audit of recruiter shortlist decisions. IMMUTABLE: UPDATE/DELETE
+// are blocked by Postgres rules (see rls.sql).
+model ShortlistAction {
+  id            String   @id @default(uuid()) @db.Uuid
+  applicationId String   @map("application_id") @db.Uuid
+  orgId         String   @map("org_id") @db.Uuid
+  recruiterId   String   @map("recruiter_id") @db.Uuid
+  action        String   // APPROVED | REJECTED | HOLD
+  note          String?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  application Application @relation(fields: [applicationId], references: [id])
+
+  @@index([applicationId])
+  @@index([orgId])
+  @@map("shortlist_actions")
+}
+
+// ----------------------------------------------------------------------------
+// Consent (candidate-scoped, global)
+// ----------------------------------------------------------------------------
+
+model ConsentLog {
+  id          String        @id @default(uuid()) @db.Uuid
+  candidateId String        @map("candidate_id") @db.Uuid
+  type        ConsentType
+  status      ConsentStatus @default(PENDING)
+  channel     String        // EMAIL | SMS | WEB | VOICE
+  ip          String?
+  userAgent   String?       @map("user_agent")
+  version     String        @default("1.0")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  candidate Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  @@index([candidateId])
+  @@index([type])
+  @@map("consent_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Voice AI (org-scoped)
+// ----------------------------------------------------------------------------
+
+model VoiceCampaign {
+  id              String         @id @default(uuid()) @db.Uuid
+  orgId           String         @map("org_id") @db.Uuid
+  jdId            String         @map("jd_id") @db.Uuid
+  name            String
+  status          CampaignStatus @default(DRAFT)
+  callsPerHour    Int            @default(20) @map("calls_per_hour") // 10–50
+  totalCandidates Int            @default(0) @map("total_candidates")
+  completedCalls  Int            @default(0) @map("completed_calls")
+  skippedCalls    Int            @default(0) @map("skipped_calls")
+  consentingCount Int            @default(0) @map("consenting_count")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  org      Organisation @relation(fields: [orgId], references: [id])
+  callLogs CallLog[]
+
+  @@index([orgId])
+  @@index([status])
+  @@map("voice_campaigns")
+}
+
+model CallLog {
+  id                String     @id @default(uuid()) @db.Uuid
+  campaignId        String     @map("campaign_id") @db.Uuid
+  candidateId       String     @map("candidate_id") @db.Uuid
+  orgId             String     @map("org_id") @db.Uuid
+  status            CallStatus @default(PENDING)
+  // Pre-call gate result (PreCallGate from @jobhunter/types):
+  // { voice_consent, not_on_dnc, time_window, platform_throttle, org_throttle }
+  gate              Json?
+  skipReason        String?    @map("skip_reason")
+  durationSec       Int?       @map("duration_sec")
+  riskLevel         RiskLevel? @map("risk_level")
+  intentConfidence  Float?     @map("intent_confidence")
+  outcome           String?
+  transcriptKey     String?    @map("transcript_key") // S3 key, signed-URL on read
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+
+  campaign  VoiceCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  candidate Candidate     @relation(fields: [candidateId], references: [id])
+
+  @@index([campaignId])
+  @@index([candidateId])
+  @@index([orgId])
+  @@index([status])
+  @@map("call_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Email (org-scoped)
+// ----------------------------------------------------------------------------
+
+model EmailCampaign {
+  id              String         @id @default(uuid()) @db.Uuid
+  orgId           String         @map("org_id") @db.Uuid
+  jdId            String?        @map("jd_id") @db.Uuid
+  name            String
+  subject         String
+  body            String?
+  status          CampaignStatus @default(DRAFT)
+  totalRecipients Int            @default(0) @map("total_recipients")
+  sent            Int            @default(0)
+  opened          Int            @default(0)
+  clicked         Int            @default(0)
+  unsubscribed    Int            @default(0)
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  org        Organisation     @relation(fields: [orgId], references: [id])
+  recipients EmailRecipient[]
+
+  @@index([orgId])
+  @@index([status])
+  @@map("email_campaigns")
+}
+
+model EmailRecipient {
+  id           String    @id @default(uuid()) @db.Uuid
+  campaignId   String    @map("campaign_id") @db.Uuid
+  orgId        String    @map("org_id") @db.Uuid
+  candidateId  String?   @map("candidate_id") @db.Uuid
+  email        String
+  sentAt       DateTime? @map("sent_at")
+  openedAt     DateTime? @map("opened_at")
+  clickedAt    DateTime? @map("clicked_at")
+  unsubscribedAt DateTime? @map("unsubscribed_at")
+  bounced      Boolean   @default(false)
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  campaign EmailCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+  @@index([orgId])
+  @@map("email_recipients")
+}
+
+// ----------------------------------------------------------------------------
+// Interviews / feedback / offers (org-scoped)
+// ----------------------------------------------------------------------------
+
+model Interview {
+  id              String          @id @default(uuid()) @db.Uuid
+  applicationId   String          @map("application_id") @db.Uuid
+  candidateId     String          @map("candidate_id") @db.Uuid
+  orgId           String          @map("org_id") @db.Uuid
+  type            InterviewType
+  status          InterviewStatus @default(SCHEDULED)
+  scheduledAt     DateTime        @map("scheduled_at")
+  durationMin     Int             @default(45) @map("duration_min")
+  platform        String          @default("GOOGLE_MEET") // GOOGLE_MEET|ZOOM|TEAMS|PHONE|ONSITE
+  interviewerIds  String[]        @map("interviewer_ids")
+  joinUrl         String?         @map("join_url")
+  rescheduleCount Int             @default(0) @map("reschedule_count")
+  prepChecklist   Json?           @map("prep_checklist")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  application Application         @relation(fields: [applicationId], references: [id])
+  feedback   FeedbackScorecard[]
+
+  @@index([applicationId])
+  @@index([orgId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@map("interviews")
+}
+
+model FeedbackScorecard {
+  id             String   @id @default(uuid()) @db.Uuid
+  interviewId    String   @map("interview_id") @db.Uuid
+  orgId          String   @map("org_id") @db.Uuid
+  reviewerId     String   @map("reviewer_id") @db.Uuid
+  technical      Int      // 1–5
+  communication  Int
+  problemSolving Int      @map("problem_solving")
+  cultureFit     Int      @map("culture_fit")
+  recommendation String   // STRONG_YES | YES | NO | STRONG_NO
+  comments       String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  interview Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([interviewId])
+  @@index([orgId])
+  @@map("feedback_scorecards")
+}
+
+model Offer {
+  id            String      @id @default(uuid()) @db.Uuid
+  applicationId String      @map("application_id") @db.Uuid
+  orgId         String      @map("org_id") @db.Uuid
+  status        OfferStatus @default(DRAFT)
+  baseSalary    Int         @map("base_salary")
+  currency      String      @default("INR")
+  joiningDate   DateTime    @map("joining_date")
+  validUntil    DateTime    @map("valid_until")
+  approverId    String?     @map("approver_id") @db.Uuid
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  application Application @relation(fields: [applicationId], references: [id])
+
+  @@index([applicationId])
+  @@index([orgId])
+  @@index([status])
+  @@map("offers")
+}
+
+// ----------------------------------------------------------------------------
+// Notifications & devices
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id          String           @id @default(uuid()) @db.Uuid
+  userId      String           @map("user_id") @db.Uuid
+  type        NotificationType
+  title       String
+  body        String
+  read        Boolean          @default(false)
+  actionRoute String?          @map("action_route")
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, read])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+// Push device registration (G-035). Multiple devices per user.
+model DeviceToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  token     String   @unique
+  platform  String   // IOS | ANDROID | WEB
+  lastSeenAt DateTime? @map("last_seen_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+// ----------------------------------------------------------------------------
+// Audit & AI governance (append-only / immutable)
+// ----------------------------------------------------------------------------
+
+// IMMUTABLE: UPDATE and DELETE are blocked at the DB level by Postgres rules
+// (rls.sql: no_update_audit / no_delete_audit). Application code only INSERTs.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String   @map("actor_id") @db.Uuid
+  actorName  String?  @map("actor_name")
+  action     String   // e.g. CANDIDATE_PII_READ, JD_PUBLISHED
+  resource   String   // table/aggregate name
+  resourceId String?  @map("resource_id")
+  orgId      String?  @map("org_id") @db.Uuid // null for global (candidate) reads
+  ip         String?
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([actorId])
+  @@index([orgId])
+  @@index([resource, resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// Every AI decision is recorded for governance / monitoring (FR-A-005).
+// IMMUTABLE except reviewer_action update path is handled by a dedicated
+// service method writing a NEW row — see rls.sql (append-only).
+model AiAuditLog {
+  id             String     @id @default(uuid()) @db.Uuid
+  function       AiFunction
+  orgId          String?    @map("org_id") @db.Uuid
+  subjectId      String?    @map("subject_id") // candidate/jd/application id
+  model          String     // e.g. claude-opus-4-8
+  promptVersion  String     @map("prompt_version")
+  inputHash      String?    @map("input_hash") // hash of prompt input (no raw PII)
+  outputSummary  String?    @map("output_summary")
+  confidence     Float?
+  latencyMs      Int?       @map("latency_ms")
+  tokenCost      Float?     @map("token_cost")
+  reviewerAction String?    @map("reviewer_action") // ACCEPTED | OVERRIDDEN | null
+  reviewerId     String?    @map("reviewer_id") @db.Uuid
+  createdAt      DateTime   @default(now()) @map("created_at")
+
+  @@index([function])
+  @@index([orgId])
+  @@index([subjectId])
+  @@index([createdAt])
+  @@map("ai_audit_logs")
+}
+
+// Records candidate dedup/merge operations (FR-R-021 golden record).
+model CandidateMergeLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  targetId        String   @map("target_id") @db.Uuid // surviving master
+  sourceId        String   @map("source_id") @db.Uuid // merged-away record
+  matchedOn       Json     @map("matched_on") // {email, phone, name_similarity}
+  similarityScore Float    @map("similarity_score")
+  performedBy     String?  @map("performed_by") @db.Uuid // null = automated
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  target Candidate @relation("MergeTarget", fields: [targetId], references: [id])
+  source Candidate @relation("MergeSource", fields: [sourceId], references: [id])
+
+  @@index([targetId])
+  @@index([sourceId])
+  @@map("candidate_merge_logs")
+}
+
+// ----------------------------------------------------------------------------
+// Misc org-scoped config
+// ----------------------------------------------------------------------------
+
+model ScreeningQuestion {
+  id        String   @id @default(uuid()) @db.Uuid
+  orgId     String   @map("org_id") @db.Uuid
+  jdId      String?  @map("jd_id") @db.Uuid
+  question  String
+  expectedKeywords String[] @map("expected_keywords")
+  weight    Float    @default(1.0)
+  order     Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  org Organisation @relation(fields: [orgId], references: [id])
+
+  @@index([orgId])
+  @@index([jdId])
+  @@map("screening_questions")
+}
+
+// DNC / suppression list. orgId null => platform-wide block.
+model BlacklistEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  orgId     String?  @map("org_id") @db.Uuid
+  email     String?
+  phone     String?
+  reason    String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  org Organisation? @relation(fields: [orgId], references: [id])
+
+  @@index([orgId])
+  @@index([email])
+  @@index([phone])
+  @@map("blacklist_entries")
+}
